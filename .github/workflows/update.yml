@@ -2,7 +2,7 @@ name: Daily Obituary Update
 
 on:
   schedule:
-    - cron: '0 13 * * *'   # 9am EDT / 8am EST (UTC-4/UTC-5)
+    - cron: '0 9 * * *'   # 5am EDT / 6am EST
   workflow_dispatch:         # Allow manual trigger from GitHub Actions UI
 
 permissions:
