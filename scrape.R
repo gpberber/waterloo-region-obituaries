@@ -164,10 +164,11 @@ empty_df <- function() tibble(
 
 # ── Scrape Dignity Memorial ────────────────────────────────────────────────────
 
-scrape_dignity <- function() {
-  message("Scraping Dignity Memorial...")
-  page    <- fetch_page("https://www.dignitymemorial.com/en-ca/obituaries?locationcode=3688")
-  entries <- page |> html_elements("a[href*='/obituaries/kitchener']")
+scrape_dignity <- function(location_code, city_slug, label = "Dignity Memorial") {
+  message("Scraping Dignity Memorial (", label, ")...")
+  url     <- paste0("https://www.dignitymemorial.com/en-ca/obituaries?locationcode=", location_code)
+  page    <- fetch_page(url)
+  entries <- page |> html_elements(paste0("a[href*='/obituaries/", city_slug, "']"))
 
   dates_txt <- entries |>
     html_element("[class*='screen-title-date'] span") |>
@@ -175,13 +176,75 @@ scrape_dignity <- function() {
     str_squish()
 
   tibble(
-    source     = "Dignity Memorial",
+    source     = label,
     name       = entries |> html_element("h3 span") |> html_text(trim = TRUE),
     birth_year = str_match(dates_txt, "(\\d{2})/(\\d{2})/(\\d{4})")[, 4],
     url        = entries |> html_attr("href"),
     date_added = today
   ) |>
     filter(!is.na(name), name != "")
+}
+
+# ── Scrape Dreisinger Funeral Home (sitemap + JSON-LD) ────────────────────────
+
+scrape_dreisinger <- function(n_recent = 30) {
+  message("Scraping Dreisinger Funeral Home (via sitemap)...")
+
+  # File 3 is listed first in the sitemap index — it contains the most recent entries
+  sitemap_txt <- tryCatch(
+    content(GET("https://www.dreisingerfuneralhome.com/obituaries-sitemap/3.xml.gz",
+                add_headers("User-Agent" = ua)), "text", encoding = "UTF-8"),
+    error = function(e) { message("  Sitemap failed: ", e$message); NULL }
+  )
+  if (is.null(sitemap_txt)) return(empty_df())
+
+  all_urls <- str_extract_all(
+    sitemap_txt,
+    "https://www\\.dreisingerfuneralhome\\.com/obituaries/[^\\s<\"]+")[[1]]
+
+  ob_ids <- str_match(all_urls, "obId=(\\d+)")[, 2] |> as.integer()
+
+  recent_urls <- tibble(url = all_urls, ob_id = ob_ids) |>
+    filter(!is.na(ob_id)) |>
+    arrange(desc(ob_id)) |>
+    slice_head(n = n_recent) |>
+    filter(!url %in% existing$url) |>
+    pull(url)
+
+  message("  New Dreisinger entries to process: ", length(recent_urls))
+  if (length(recent_urls) == 0) return(empty_df())
+
+  results <- list()
+  for (url in recent_urls) {
+    pg <- tryCatch(fetch_page(url), error = function(e) NULL)
+    if (is.null(pg)) { Sys.sleep(0.5); next }
+
+    ld_scripts <- pg |>
+      html_elements('script[type="application/ld+json"]') |>
+      html_text()
+    person_ld <- ld_scripts[str_detect(ld_scripts, '"@type"\\s*:\\s*"Person"')]
+
+    if (length(person_ld) > 0) {
+      person <- tryCatch(fromJSON(person_ld[1]), error = function(e) NULL)
+      if (!is.null(person) && !is.null(person$name)) {
+        name       <- str_replace_all(person$name, "&quot;", '"') |> str_squish()
+        birth_year <- str_extract(person$birthDate %||% "", "\\b(19|20)\\d{2}\\b")
+        if (nchar(name) > 0) {
+          results[[url]] <- tibble(
+            source     = "Dreisinger Funeral Home",
+            name       = name,
+            birth_year = birth_year,
+            url        = url,
+            date_added = today
+          )
+        }
+      }
+    }
+    Sys.sleep(0.5)
+  }
+
+  if (length(results) == 0) return(empty_df())
+  bind_rows(results)
 }
 
 # ── Scrape Henry Walser ────────────────────────────────────────────────────────
@@ -245,14 +308,22 @@ scrape_walser <- function(n_recent = 30) {
 
 # ── Run scrapers ───────────────────────────────────────────────────────────────
 
-record_data  <- tryCatch(scrape_record(),       error = function(e) { message("Record failed: ",  e$message); empty_df() })
-erb_data     <- tryCatch(scrape_erb_good(n_pages = 2), error = function(e) { message("ERB Good failed: ", e$message); empty_df() })
-dignity_data <- tryCatch(scrape_dignity(),      error = function(e) { message("Dignity failed: ", e$message); empty_df() })
-walser_data  <- tryCatch(scrape_walser(),       error = function(e) { message("Walser failed: ",  e$message); empty_df() })
+record_data      <- tryCatch(scrape_record(),       error = function(e) { message("Record failed: ",    e$message); empty_df() })
+erb_data         <- tryCatch(scrape_erb_good(n_pages = 2), error = function(e) { message("ERB Good failed: ", e$message); empty_df() })
+dignity_kw       <- tryCatch(scrape_dignity(3688, "kitchener",  "Dignity Memorial (Kitchener)"),  error = function(e) { message("Dignity KW failed: ",  e$message); empty_df() })
+dignity_cam1     <- tryCatch(scrape_dignity(3141, "cambridge-on", "Dignity Memorial (Cambridge)"), error = function(e) { message("Dignity Cam1 failed: ", e$message); empty_df() })
+dignity_cam2     <- tryCatch(scrape_dignity(3762, "cambridge-on", "Dignity Memorial (Cambridge)"), error = function(e) { message("Dignity Cam2 failed: ", e$message); empty_df() })
+dignity_cam3     <- tryCatch(scrape_dignity(3763, "cambridge-on", "Dignity Memorial (Cambridge)"), error = function(e) { message("Dignity Cam3 failed: ", e$message); empty_df() })
+walser_data      <- tryCatch(scrape_walser(),       error = function(e) { message("Walser failed: ",    e$message); empty_df() })
+dreisinger_data  <- tryCatch(scrape_dreisinger(),   error = function(e) { message("Dreisinger failed: ",e$message); empty_df() })
 
 # ── Merge and save ─────────────────────────────────────────────────────────────
 
-new_entries <- bind_rows(record_data, erb_data, dignity_data, walser_data) |>
+new_entries <- bind_rows(
+  record_data, erb_data,
+  dignity_kw, dignity_cam1, dignity_cam2, dignity_cam3,
+  walser_data, dreisinger_data
+) |>
   filter(!url %in% existing$url)
 
 message("New entries today: ", nrow(new_entries))
@@ -362,7 +433,7 @@ html <- paste0(
 
 <header>
   <h1>Waterloo Region Obituaries</h1>
-  <p>Compiled daily from the Waterloo Region Record, Erb &amp; Good, Dignity Memorial, and Henry Walser Funeral Home &mdash; ',
+  <p>Compiled daily from the Waterloo Region Record, Erb &amp; Good, Dignity Memorial (Kitchener &amp; Cambridge), Henry Walser, and Dreisinger Funeral Home &mdash; ',
   nrow(all_data),
   ' entries total.</p>
 </header>
