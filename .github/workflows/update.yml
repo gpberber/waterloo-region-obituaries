@@ -30,7 +30,7 @@ jobs:
 
       - name: Install R packages
         run: |
-          Rscript -e "install.packages(c('rvest', 'httr', 'dplyr', 'readr', 'stringr', 'lubridate'))"
+          Rscript -e "install.packages(c('rvest', 'httr', 'dplyr', 'readr', 'stringr', 'lubridate', 'jsonlite'))"
 
       - name: Run scraper
         run: Rscript scrape.R

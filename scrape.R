@@ -5,6 +5,7 @@ suppressPackageStartupMessages({
   library(readr)
   library(stringr)
   library(lubridate)
+  library(jsonlite)
 })
 
 ua       <- "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -152,24 +153,106 @@ scrape_erb_good <- function(n_pages = 2) {
   erb_df |> mutate(date_added = today)
 }
 
-# ── Run scrapers ───────────────────────────────────────────────────────────────
+# ── Helpers: empty tibble and null-coalescing ──────────────────────────────────
 
 empty_df <- function() tibble(
   source = character(), name = character(), birth_year = character(),
   url = character(), date_added = as_date(character())
 )
 
-record_data <- tryCatch(scrape_record(), error = function(e) {
-  message("Record scraper failed: ", e$message); empty_df()
-})
+`%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !is.na(a)) a else b
 
-erb_data <- tryCatch(scrape_erb_good(n_pages = 2), error = function(e) {
-  message("ERB Good scraper failed: ", e$message); empty_df()
-})
+# ── Scrape Dignity Memorial ────────────────────────────────────────────────────
+
+scrape_dignity <- function() {
+  message("Scraping Dignity Memorial...")
+  page    <- fetch_page("https://www.dignitymemorial.com/en-ca/obituaries?locationcode=3688")
+  entries <- page |> html_elements("a[href*='/obituaries/kitchener']")
+
+  dates_txt <- entries |>
+    html_element("[class*='screen-title-date'] span") |>
+    html_text(trim = TRUE) |>
+    str_squish()
+
+  tibble(
+    source     = "Dignity Memorial",
+    name       = entries |> html_element("h3 span") |> html_text(trim = TRUE),
+    birth_year = str_match(dates_txt, "(\\d{2})/(\\d{2})/(\\d{4})")[, 4],
+    url        = entries |> html_attr("href"),
+    date_added = today
+  ) |>
+    filter(!is.na(name), name != "")
+}
+
+# ── Scrape Henry Walser ────────────────────────────────────────────────────────
+
+scrape_walser <- function(n_recent = 30) {
+  message("Scraping Henry Walser (via sitemap)...")
+  sitemap_txt <- tryCatch(
+    content(GET("https://www.henrywalser.com/obituaries-sitemap/17.xml.gz",
+                add_headers("User-Agent" = ua)), "text", encoding = "UTF-8"),
+    error = function(e) { message("  Sitemap failed: ", e$message); NULL }
+  )
+  if (is.null(sitemap_txt)) return(empty_df())
+
+  all_urls <- str_extract_all(
+    sitemap_txt, "https://www\\.henrywalser\\.com/obituaries/[^\\s<\"]+")[[1]]
+
+  ob_ids <- str_match(all_urls, "obId=(\\d+)")[, 2] |> as.integer()
+
+  recent_urls <- tibble(url = all_urls, ob_id = ob_ids) |>
+    filter(!is.na(ob_id)) |>
+    arrange(desc(ob_id)) |>
+    slice_head(n = n_recent) |>
+    filter(!url %in% existing$url) |>
+    pull(url)
+
+  message("  New Walser entries to process: ", length(recent_urls))
+  if (length(recent_urls) == 0) return(empty_df())
+
+  results <- list()
+  for (url in recent_urls) {
+    pg <- tryCatch(fetch_page(url), error = function(e) NULL)
+    if (is.null(pg)) { Sys.sleep(0.5); next }
+
+    ld_scripts <- pg |>
+      html_elements('script[type="application/ld+json"]') |>
+      html_text()
+    person_ld <- ld_scripts[str_detect(ld_scripts, '"@type"\\s*:\\s*"Person"')]
+
+    if (length(person_ld) > 0) {
+      person <- tryCatch(fromJSON(person_ld[1]), error = function(e) NULL)
+      if (!is.null(person) && !is.null(person$name)) {
+        name       <- str_replace_all(person$name, "&quot;", '"') |> str_squish()
+        birth_year <- str_extract(person$birthDate %||% "", "\\b(19|20)\\d{2}\\b")
+        if (nchar(name) > 0) {
+          results[[url]] <- tibble(
+            source     = "Henry Walser",
+            name       = name,
+            birth_year = birth_year,
+            url        = url,
+            date_added = today
+          )
+        }
+      }
+    }
+    Sys.sleep(0.5)
+  }
+
+  if (length(results) == 0) return(empty_df())
+  bind_rows(results)
+}
+
+# ── Run scrapers ───────────────────────────────────────────────────────────────
+
+record_data  <- tryCatch(scrape_record(),       error = function(e) { message("Record failed: ",  e$message); empty_df() })
+erb_data     <- tryCatch(scrape_erb_good(n_pages = 2), error = function(e) { message("ERB Good failed: ", e$message); empty_df() })
+dignity_data <- tryCatch(scrape_dignity(),      error = function(e) { message("Dignity failed: ", e$message); empty_df() })
+walser_data  <- tryCatch(scrape_walser(),       error = function(e) { message("Walser failed: ",  e$message); empty_df() })
 
 # ── Merge and save ─────────────────────────────────────────────────────────────
 
-new_entries <- bind_rows(record_data, erb_data) |>
+new_entries <- bind_rows(record_data, erb_data, dignity_data, walser_data) |>
   filter(!url %in% existing$url)
 
 message("New entries today: ", nrow(new_entries))
@@ -279,7 +362,7 @@ html <- paste0(
 
 <header>
   <h1>Waterloo Region Obituaries</h1>
-  <p>Compiled daily from the Waterloo Region Record and Erb &amp; Good Family Funeral Home &mdash; ',
+  <p>Compiled daily from the Waterloo Region Record, Erb &amp; Good, Dignity Memorial, and Henry Walser Funeral Home &mdash; ',
   nrow(all_data),
   ' entries total.</p>
 </header>
