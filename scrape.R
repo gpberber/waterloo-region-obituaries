@@ -23,7 +23,11 @@ html_escape <- function(x) {
 }
 
 fetch_page <- function(url) {
-  resp <- GET(url, add_headers("User-Agent" = ua))
+  resp <- GET(url, add_headers(
+    "User-Agent"      = ua,
+    "Accept"          = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language" = "en-CA,en;q=0.9"
+  ))
   if (http_error(resp)) stop("HTTP ", status_code(resp), " for ", url)
   read_html(content(resp, "text", encoding = "UTF-8"))
 }
@@ -169,13 +173,14 @@ scrape_dignity <- function(location_code, city_slug, label = "Dignity Memorial")
   url     <- paste0("https://www.dignitymemorial.com/en-ca/obituaries?locationcode=", location_code)
   page    <- fetch_page(url)
   entries <- page |> html_elements(paste0("a[href*='/obituaries/", city_slug, "']"))
+  message("  Entries found: ", length(entries))
 
   dates_txt <- entries |>
     html_element("[class*='screen-title-date'] span") |>
     html_text(trim = TRUE) |>
     str_squish()
 
-  tibble(
+  df <- tibble(
     source     = label,
     name       = entries |> html_element("h3 span") |> html_text(trim = TRUE),
     birth_year = str_match(dates_txt, "(\\d{2})/(\\d{2})/(\\d{4})")[, 4],
@@ -183,6 +188,9 @@ scrape_dignity <- function(location_code, city_slug, label = "Dignity Memorial")
     date_added = today
   ) |>
     filter(!is.na(name), name != "")
+
+  message("  New entries: ", sum(!df$url %in% existing$url))
+  df
 }
 
 # ── Scrape Dreisinger Funeral Home (sitemap + JSON-LD) ────────────────────────
